@@ -1,6 +1,9 @@
 %% -*- mode: erlang -*-
 {VSN,
  [
+   {"4.3.3", [
+     {load_module, emqx_channel, brutal_purge, soft_purge, []}
+   ]},
    {"4.3.2", [
      {load_module, emqx_http_lib, brutal_purge, soft_purge, []}
    ]},
