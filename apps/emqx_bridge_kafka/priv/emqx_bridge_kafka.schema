@@ -1,0 +1,28 @@
+{mapping, "bridge.kafka.server", "emqx_bridge_kafka.server", [
+  {default, "127.0.0.1:9092"},
+  {datatype, [string]}
+]}.
+
+{mapping, "bridge.kafka.topic", "emqx_bridge_kafka.server", [
+  {default, "test"},
+  {datatype, string},
+  hidden
+]}.
+
+{
+    translation,"emqx_bridge_kafka.server",fun(Conf)->
+        {RHost,RPort} = case cuttlefish:conf_get("bridge.kafka.server",Conf) of
+                {Ip,Port} -> {Ip,Port};
+                 S         -> case string:tokens(S,":") of
+                [Domain] -> {Domain,9002};
+                [Domain,Port] -> {Domain,list_to_integer(Port)}
+                end
+        end,
+        Topic = cuttlefish:conf_get("bridge.kafka.topic",Conf),
+        [
+            {host,RHost},
+            {port,RPort},
+            {topic,Topic}
+        ]
+        end
+}.
