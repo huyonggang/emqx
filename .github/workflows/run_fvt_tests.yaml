@@ -1,282 +1,248 @@
 name: Functional Verification Tests
 
+concurrency:
+  group: fvt-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
+    branches:
+      - '**'
     tags:
       - v*
-      - e*
-  release:
-    types:
-      - published
   pull_request:
 
 jobs:
-    docker_test:
-        runs-on: ubuntu-20.04
+  prepare:
+    runs-on: ubuntu-20.04
+    # prepare source with any OTP version, no need for a matrix
+    container: ghcr.io/emqx/emqx-builder/5.0-17:1.13.4-24.2.1-1-alpine3.15.1
 
-        steps:
-        - uses: actions/checkout@v1
-        - uses: gleam-lang/setup-erlang@v1.1.2
-          id: install_erlang
-          with:
-            otp-version: 23.2
-        - name: prepare
-          run: |
-            if make emqx-ee --dry-run > /dev/null 2>&1; then
-              echo "https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com" > $HOME/.git-credentials
-              git config --global credential.helper store
-              echo "${{ secrets.CI_GIT_TOKEN }}" >> scripts/git-token
-              make deps-emqx-ee
-              echo "TARGET=emqx/emqx-ee" >> $GITHUB_ENV
-              echo "EMQX_TAG=$(./pkg-vsn.sh)" >> $GITHUB_ENV
-            else
-              echo "TARGET=emqx/emqx" >> $GITHUB_ENV
-              echo "EMQX_TAG=$(./pkg-vsn.sh)" >> $GITHUB_ENV
-            fi
-        - name: make emqx image
-          run: make docker
-        - name: run emqx
-          timeout-minutes: 5
-          run: |
-            set -e -u -x
-            echo "CUTTLEFISH_ENV_OVERRIDE_PREFIX=EMQX_" >> .ci/docker-compose-file/conf.cluster.env
-            echo "EMQX_ZONE__EXTERNAL__RETRY_INTERVAL=2s" >> .ci/docker-compose-file/conf.cluster.env
-            echo "EMQX_MQTT__MAX_TOPIC_ALIAS=10" >> .ci/docker-compose-file/conf.cluster.env
-            docker-compose \
-                -f .ci/docker-compose-file/docker-compose-emqx-cluster.yaml \
-                -f .ci/docker-compose-file/docker-compose-python.yaml \
-                up -d
-            while ! docker exec -i node1.emqx.io bash -c "emqx eval \"['emqx@node1.emqx.io','emqx@node2.emqx.io'] = maps:get(running_nodes, ekka_cluster:info()).\"" > /dev/null 2>&1; do
-                echo "['$(date -u +"%Y-%m-%dT%H:%M:%SZ")']:waiting emqx";
-                sleep 5;
-            done
-        - name: verify EMQX_LOADED_PLUGINS override working
-          run: |
-            expected="{emqx_sn, true}."
-            output=$(docker exec -i node1.emqx.io bash -c "cat data/loaded_plugins" | tail -n1)
-            if [ "$expected" != "$output" ]; then
-                exit 1
-            fi
-        - name: make paho tests
-          run: |
-            if ! docker exec -i python /scripts/pytest.sh; then
-              docker logs node1.emqx.io
-              docker logs node2.emqx.io
-              exit 1
-            fi
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          path: source
+          fetch-depth: 0
+      - name: get deps
+        run: |
+          make -C source deps-all
+          zip -ryq source.zip source/* source/.[^.]*
+      - uses: actions/upload-artifact@v2
+        with:
+          name: source
+          path: source.zip
 
-    helm_test:
-        runs-on: ubuntu-20.04
+  docker_test:
+    runs-on: ubuntu-20.04
+    needs: prepare
 
-        steps:
-        - uses: actions/checkout@v1
-        - uses: gleam-lang/setup-erlang@v1.1.2
-          id: install_erlang
-          with:
-            otp-version: 23.2
-        - name: prepare
-          run: |
-            if make emqx-ee --dry-run > /dev/null 2>&1; then
-              echo "https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com" > $HOME/.git-credentials
-              git config --global credential.helper store
-              echo "${{ secrets.CI_GIT_TOKEN }}" >> scripts/git-token
-              make deps-emqx-ee
-              echo "TARGET=emqx/emqx-ee" >> $GITHUB_ENV
-            else
-              echo "TARGET=emqx/emqx" >> $GITHUB_ENV
-            fi
-        - name: make emqx image
-          run: make docker
-        - name: install k3s
-          env:
-            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
-          run: |
-            sudo sh -c "echo \"127.0.0.1 $(hostname)\" >> /etc/hosts"
-            curl -sfL https://get.k3s.io | sh -
-            sudo chmod 644 /etc/rancher/k3s/k3s.yaml
-            kubectl cluster-info
-        - name: install helm
-          env:
-            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
-          run: |
-            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
-            sudo chmod 700 get_helm.sh
-            sudo ./get_helm.sh
-            helm version
-        - name: run emqx on chart
-          env:
-            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
-          timeout-minutes: 5
-          run: |
-            version=$(./pkg-vsn.sh)
-            sudo docker save ${TARGET}:$version -o emqx.tar.gz
-            sudo k3s ctr image import emqx.tar.gz
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - emqx
+          - emqx-enterprise
+          - emqx-elixir
+        cluster_db_backend:
+          - mnesia
+          - rlog
+        os:
+          - ["alpine3.15.1", "alpine:3.15.1"]
+        otp:
+          - 24.2.1-1
+        elixir:
+          - 1.13.4
+        arch:
+          - amd64
+    steps:
+    - uses: erlef/setup-beam@v1
+      with:
+        otp-version: "24.2"
+    - uses: actions/download-artifact@v2
+      with:
+        name: source
+        path: .
+    - name: unzip source code
+      run: unzip -q source.zip
 
-            sed -i -r "s/^appVersion: .*$/appVersion: \"${version}\"/g" deploy/charts/emqx/Chart.yaml
-            sed -i '/emqx_telemetry/d' deploy/charts/emqx/values.yaml
+    - name: make docker image
+      working-directory: source
+      env:
+        EMQX_BUILDER: ghcr.io/emqx/emqx-builder/5.0-17:${{ matrix.elixir }}-${{ matrix.otp }}-${{ matrix.os[0] }}
+        EMQX_RUNNER: ${{ matrix.os[1] }}
+      run: |
+        make ${{ matrix.profile }}-docker
+    - name: run emqx
+      timeout-minutes: 5
+      working-directory: source
+      run: |
+        set -x
+        if [[ "${{ matrix.profile }}" = *-elixir ]]
+        then
+          export IS_ELIXIR=yes
+          PROFILE=$(echo ${{ matrix.profile }} | sed -e "s/-elixir//g")
+          IMAGE=emqx/$PROFILE:$(./pkg-vsn.sh ${{ matrix.profile }})-elixir
+        else
+          IMAGE=emqx/${{ matrix.profile }}:$(./pkg-vsn.sh ${{ matrix.profile }})
+        fi
+        ./.ci/docker-compose-file/scripts/run-emqx.sh $IMAGE ${{ matrix.cluster_db_backend }}
+    - name: make paho tests
+      run: |
+        if ! docker exec -i python /scripts/pytest.sh "${{ matrix.cluster_db_backend }}"; then
+          echo "DUMP_CONTAINER_LOGS_BGN"
+          echo "============== haproxy =============="
+          docker logs haproxy
+          echo "==============  node1  =============="
+          docker logs node1.emqx.io
+          echo "==============  node2  =============="
+          docker logs node2.emqx.io
+          echo "DUMP_CONTAINER_LOGS_END"
+          exit 1
+        fi
+    # simple smoke test for node_dump
+    - name: test node_dump
+      run: |
+        docker exec node1.emqx.io node_dump
 
-            helm install emqx \
-                --set image.repository=${TARGET} \
-                --set image.pullPolicy=Never \
-                --set emqxAclConfig="" \
-                --set image.pullPolicy=Never \
-                --set emqxConfig.EMQX_ZONE__EXTERNAL__RETRY_INTERVAL=2s \
-                --set emqxConfig.EMQX_MQTT__MAX_TOPIC_ALIAS=10 \
-                deploy/charts/emqx \
-                --debug
+  helm_test:
+    runs-on: ubuntu-20.04
+    needs: prepare
 
-            while [ "$(kubectl get StatefulSet -l app.kubernetes.io/name=emqx -o jsonpath='{.items[0].status.replicas}')" \
-              != "$(kubectl get StatefulSet -l app.kubernetes.io/name=emqx -o jsonpath='{.items[0].status.readyReplicas}')" ]; do
-              echo "==============================";
-              kubectl get pods;
-              echo "==============================";
-              echo "waiting emqx started";
-              sleep 10;
-            done
-        - name: get pods log
-          if: failure()
-          env:
-            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
-          run: kubectl describe pods emqx-0
-        - uses: actions/checkout@v2
-          with:
-            repository: emqx/paho.mqtt.testing
-            ref: develop-4.0
-            path: paho.mqtt.testing
-        - name: install pytest
-          run: |
-            pip install pytest
-            echo "$HOME/.local/bin" >> $GITHUB_PATH
-        - name: run paho test
-          env:
-            KUBECONFIG: "/etc/rancher/k3s/k3s.yaml"
-          run: |
-            emqx_svc=$(kubectl get svc --namespace default emqx -o jsonpath="{.spec.clusterIP}")
-            emqx1=$(kubectl get pods emqx-1 -o jsonpath='{.status.podIP}')
-            emqx2=$(kubectl get pods emqx-2 -o jsonpath='{.status.podIP}')
+    strategy:
+      fail-fast: false
+      matrix:
+        discovery:
+        - k8s
+        - dns
+        profile:
+        - emqx
+        os:
+        - ["debian11", "debian:11-slim"]
+        otp:
+        - 24.2.1-1
+        elixir:
+        - 1.13.4
+        arch:
+        - amd64
+      # - emqx-enterprise # TODO test enterprise
 
-            pytest -v paho.mqtt.testing/interoperability/test_client/V5/test_connect.py -k test_basic --host $emqx_svc
-            RESULT=$?
-            pytest -v paho.mqtt.testing/interoperability/test_cluster --host1 $emqx1 --host2 $emqx2
-            RESULT=$((RESULT + $?))
-            if [ 0 -ne $RESULT ]; then
-                kubectl logs emqx-1
-                kubectl logs emqx-2
-            fi
-            exit $RESULT
+    steps:
+    - uses: erlef/setup-beam@v1
+      with:
+        otp-version: "24.2"
+    - uses: actions/download-artifact@v2
+      with:
+        name: source
+        path: .
+    - name: unzip source code
+      run: unzip -q source.zip
 
-    relup_test:
-        runs-on: ubuntu-20.04
-        container: emqx/build-env:erl23.2.7.2-emqx-2-ubuntu20.04
-        defaults:
-          run:
-            shell: bash
-        steps:
-        - uses: actions/setup-python@v2
-          with:
-            python-version: '3.8'
-            architecture: 'x64'
-        - uses: actions/checkout@v2
-          with:
-            repository: emqx/paho.mqtt.testing
-            ref: develop-4.0
-            path: paho.mqtt.testing
-        - uses: actions/checkout@v2
-          with:
-            repository: terry-xiaoyu/one_more_emqx
-            ref: master
-            path: one_more_emqx
-        - uses: actions/checkout@v2
-          with:
-            repository: emqx/emqtt-bench
-            ref: master
-            path: emqtt-bench
-        - uses: actions/checkout@v2
-          with:
-            repository: hawk/lux
-            ref: lux-2.4
-            path: lux
-        - uses: actions/checkout@v2
-          with:
-            repository: ${{ github.repository }}
-            path: emqx
-            fetch-depth: 0
-        - name: prepare
-          run: |
-            if make -C emqx emqx-ee --dry-run > /dev/null 2>&1; then
-              echo "https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com" > $HOME/.git-credentials
-              git config --global credential.helper store
-              echo "${{ secrets.CI_GIT_TOKEN }}" >> emqx/scripts/git-token
-              echo "PROFILE=emqx-ee" >> $GITHUB_ENV
-            else
-              echo "PROFILE=emqx" >> $GITHUB_ENV
-            fi
-        - name: get version
-          run: |
-            set -e -x -u
-            cd emqx
-            if [ $PROFILE = "emqx" ];then
-                broker="emqx-ce"
-                edition='opensource'
-            else
-                broker="emqx-ee"
-                edition='enterprise'
-            fi
-            echo "BROKER=$broker" >> $GITHUB_ENV
+    - name: make docker image
+      working-directory: source
+      env:
+        EMQX_BUILDER: ghcr.io/emqx/emqx-builder/5.0-17:${{ matrix.elixir }}-${{ matrix.otp }}-${{ matrix.os[0] }}
+        EMQX_RUNNER: ${{ matrix.os[1] }}
+      run: |
+        make ${{ matrix.profile }}-docker
+        echo "TARGET=emqx/${{ matrix.profile }}" >> $GITHUB_ENV
+        echo "EMQX_TAG=$(./pkg-vsn.sh ${{ matrix.profile }})" >> $GITHUB_ENV
+    - run: minikube start
+    - name: setup helm chart
+      working-directory: source
+      run: |
+        minikube image load $TARGET:$EMQX_TAG
+        sed -i -r "s/^appVersion: .*$/appVersion: \"$EMQX_TAG\"/g" deploy/charts/emqx/Chart.yaml
+    - name: run emqx on chart
+      working-directory: source
+      if: matrix.discovery == 'k8s'
+      run: |
+        helm install emqx \
+            --set image.repository=$TARGET \
+            --set image.pullPolicy=Never \
+            --set emqxAclConfig="" \
+            --set image.pullPolicy=Never \
+            --set emqxConfig.EMQX_ZONES__DEFAULT__MQTT__RETRY_INTERVAL=2s \
+            --set emqxConfig.EMQX_ZONES__DEFAULT__MQTT__MAX_TOPIC_ALIAS=10 \
+            --set emqxConfig.EMQX_AUTHORIZATION__SOURCES=[] \
+            --set emqxConfig.EMQX_AUTHORIZATION__NO_MATCH=allow \
+            deploy/charts/emqx \
+            --debug
+    - name: run emqx on chart
+      working-directory: source
+      if: matrix.discovery == 'dns'
+      run: |
+        helm install emqx \
+            --set emqxConfig.EMQX_CLUSTER__DISCOVERY_STRATEGY="dns" \
+            --set emqxConfig.EMQX_CLUSTER__DNS__NAME="emqx-headless.default.svc.cluster.local" \
+            --set emqxConfig.EMQX_CLUSTER__DNS__RECORD_TYPE="srv" \
+            --set image.repository=$TARGET \
+            --set image.pullPolicy=Never \
+            --set emqxAclConfig="" \
+            --set image.pullPolicy=Never \
+            --set emqxConfig.EMQX_ZONES__DEFAULT__MQTT__RETRY_INTERVAL=2s \
+            --set emqxConfig.EMQX_ZONES__DEFAULT__MQTT__MAX_TOPIC_ALIAS=10 \
+            --set emqxConfig.EMQX_AUTHORIZATION__SOURCES=[] \
+            --set emqxConfig.EMQX_AUTHORIZATION__NO_MATCH=allow \
+            deploy/charts/emqx \
+            --debug
+    - name: waiting emqx started
+      timeout-minutes: 10
+      run: |
+        while [ "$(kubectl get StatefulSet -l app.kubernetes.io/name=emqx -o jsonpath='{.items[0].status.replicas}')" \
+          != "$(kubectl get StatefulSet -l app.kubernetes.io/name=emqx -o jsonpath='{.items[0].status.readyReplicas}')" ]; do
+          echo "==============================";
+          kubectl get pods;
+          echo "==============================";
+          echo "waiting emqx started";
+          sleep 10;
+        done
+    - name: Check cluster
+      timeout-minutes: 10
+      run: |
+        kubectl port-forward svc/emqx 18083:18083 &
+        while
+          [ "$(curl --silent --basic -u admin:public -X GET http://127.0.0.1:18083/api/v5/cluster| jq '.nodes|length')" != "3" ];
+        do
+          echo "waiting emqx cluster scale"
+          sleep 1
+        done
+    - name: get emqx-0 pods log
+      if: failure()
+      run: |
+        kubectl describe pods emqx-0
+        kubectl logs emqx-0
+    - name: get emqx-1 pods log
+      if: failure()
+      run: |
+        kubectl describe pods emqx-1
+        kubectl logs emqx-1
+    - name: get emqx-2 pods log
+      if: failure()
+      run: |
+        kubectl describe pods emqx-2
+        kubectl logs emqx-2
+    - uses: actions/checkout@v2
+      with:
+        repository: emqx/paho.mqtt.testing
+        ref: develop-4.0
+        path: paho.mqtt.testing
+    - name: install pytest
+      run: |
+        pip install pytest
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+    - name: run paho test
+      run: |
+        port_connected () {
+          local server="$1"
+          local port="$2"
+          echo > /dev/tcp/${server}/${port} 2>/dev/null
+        }
 
-            vsn="$(./pkg-vsn.sh)"
-            echo "VSN=$vsn" >> $GITHUB_ENV
+        kubectl port-forward service/emqx 1883:1883 > /dev/null &
 
-            pre_vsn="$(echo $vsn | grep -oE '^[0-9]+.[0-9]')"
-            if [ $PROFILE = "emqx" ]; then
-                old_vsns="$(git tag -l "v$pre_vsn.[0-9]" | xargs echo -n | sed "s/v$vsn//")"
-            else
-                old_vsns="$(git tag -l "e$pre_vsn.[0-9]" | xargs echo -n | sed "s/e$vsn//")"
-            fi
-            echo "OLD_VSNS=$old_vsns" >> $GITHUB_ENV
-        - name: download emqx
-          run: |
-            set -e -x -u
-            mkdir -p emqx/_upgrade_base
-            cd emqx/_upgrade_base
-            old_vsns=($(echo $OLD_VSNS | tr ' ' ' '))
-            for old_vsn in ${old_vsns[@]}; do
-              wget --no-verbose https://s3-us-west-2.amazonaws.com/packages.emqx/$BROKER/$old_vsn/$PROFILE-ubuntu20.04-${old_vsn#[e|v]}-amd64.zip
-            done
-        - name: build emqx
-          run: make -C emqx ${PROFILE}-zip
-        - name: build emqtt-bench
-          run: make -C emqtt-bench
-        - name: build lux
-          run: |
-            set -e -u -x
-            cd lux
-            autoconf
-            ./configure
-            make
-            make install
-        - name: run relup test
-          run: |
-            set -e -x -u
-            if [ -n "$OLD_VSNS" ]; then
-                mkdir -p packages
-                cp emqx/_packages/${PROFILE}/*.zip packages
-                cp emqx/_upgrade_base/*.zip packages
-                lux -v \
-                --timeout 600000 \
-                --var PROFILE=$PROFILE \
-                --var PACKAGE_PATH=$(pwd)/packages \
-                --var BENCH_PATH=$(pwd)/emqtt-bench \
-                --var ONE_MORE_EMQX_PATH=$(pwd)/one_more_emqx \
-                --var VSN="$VSN" \
-                --var OLD_VSNS="$OLD_VSNS" \
-                emqx/.ci/fvt_tests/relup.lux
-            fi
-        - uses: actions/upload-artifact@v1
-          if: failure()
-          with:
-            name: lux_logs
-            path: lux_logs
+        while ! port_connected localhost 1883; do
+          echo server not listening yet...
+          sleep 10
+        done
 
-
-
+        pytest -v paho.mqtt.testing/interoperability/test_client/V5/test_connect.py -k test_basic --host "127.0.0.1"

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,119 +16,207 @@
 
 -module(emqx_mgmt_api_subscriptions).
 
+-behaviour(minirest_api).
+
+-include_lib("typerefl/include/types.hrl").
 -include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/emqx_mqtt.hrl").
 
--define(SUBS_QS_SCHEMA, {emqx_suboption,
-            [{<<"clientid">>, binary},
-             {<<"topic">>, binary},
-             {<<"share">>, binary},
-             {<<"qos">>, integer},
-             {<<"_match_topic">>, binary}]}).
+-export([
+    api_spec/0,
+    paths/0,
+    schema/1,
+    fields/1
+]).
 
--rest_api(#{name   => list_subscriptions,
-            method => 'GET',
-            path   => "/subscriptions/",
-            func   => list,
-            descr  => "A list of subscriptions in the cluster"}).
+-export([subscriptions/2]).
 
--rest_api(#{name   => list_node_subscriptions,
-            method => 'GET',
-            path   => "/nodes/:atom:node/subscriptions/",
-            func   => list,
-            descr  => "A list of subscriptions on a node"}).
+-export([
+    query/4,
+    format/1
+]).
 
--rest_api(#{name   => lookup_client_subscriptions,
-            method => 'GET',
-            path   => "/subscriptions/:bin:clientid",
-            func   => lookup,
-            descr  => "A list of subscriptions of a client"}).
+-define(SUBS_QTABLE, emqx_suboption).
 
--rest_api(#{name   => lookup_client_subscriptions_with_node,
-            method => 'GET',
-            path   => "/nodes/:atom:node/subscriptions/:bin:clientid",
-            func   => lookup,
-            descr  => "A list of subscriptions of a client on the node"}).
+-define(SUBS_QSCHEMA, [
+    {<<"clientid">>, binary},
+    {<<"topic">>, binary},
+    {<<"share">>, binary},
+    {<<"share_group">>, binary},
+    {<<"qos">>, integer},
+    {<<"match_topic">>, binary}
+]).
 
--export([ list/2
-        , lookup/2
-        ]).
+-define(QUERY_FUN, {?MODULE, query}).
 
--export([ query/3
-        , format/1
-        ]).
+api_spec() ->
+    emqx_dashboard_swagger:spec(?MODULE, #{check_schema => true}).
 
--define(query_fun, {?MODULE, query}).
--define(format_fun, {?MODULE, format}).
+paths() ->
+    ["/subscriptions"].
 
-list(Bindings, Params) when map_size(Bindings) == 0 ->
-    case proplists:get_value(<<"topic">>, Params) of
-        undefined ->
-            minirest:return({ok, emqx_mgmt_api:cluster_query(Params, ?SUBS_QS_SCHEMA, ?query_fun)});
-        Topic ->
-            minirest:return({ok, emqx_mgmt:list_subscriptions_via_topic(emqx_mgmt_util:urldecode(Topic), ?format_fun)})
-    end;
+schema("/subscriptions") ->
+    #{
+        'operationId' => subscriptions,
+        get => #{
+            description => <<"List subscriptions">>,
+            parameters => parameters(),
+            responses => #{
+                200 => hoconsc:mk(hoconsc:array(hoconsc:ref(?MODULE, subscription)), #{})
+            }
+        }
+    }.
 
-list(#{node := Node} = Bindings, Params) ->
-    case proplists:get_value(<<"topic">>, Params) of
-        undefined ->
-            case Node =:= node() of
-                true ->
-                    minirest:return({ok, emqx_mgmt_api:node_query(Node, Params, ?SUBS_QS_SCHEMA, ?query_fun)});
-                false ->
-                    case rpc:call(Node, ?MODULE, list, [Bindings, Params]) of
-                        {badrpc, Reason} -> minirest:return({error, Reason});
-                        Res -> Res
-                    end
-            end;
-        Topic ->
-            minirest:return({ok, emqx_mgmt:list_subscriptions_via_topic(Node, emqx_mgmt_util:urldecode(Topic), ?format_fun)})
+fields(subscription) ->
+    [
+        {node, hoconsc:mk(binary(), #{desc => <<"Access type">>})},
+        {topic, hoconsc:mk(binary(), #{desc => <<"Topic name">>})},
+        {clientid, hoconsc:mk(binary(), #{desc => <<"Client identifier">>})},
+        {qos, hoconsc:mk(emqx_schema:qos(), #{desc => <<"QoS">>})},
+        {nl, hoconsc:mk(integer(), #{desc => <<"No Local">>})},
+        {rap, hoconsc:mk(integer(), #{desc => <<"Retain as Published">>})},
+        {rh, hoconsc:mk(integer(), #{desc => <<"Retain Handling">>})}
+    ].
+
+parameters() ->
+    [
+        hoconsc:ref(emqx_dashboard_swagger, page),
+        hoconsc:ref(emqx_dashboard_swagger, limit),
+        {
+            node,
+            hoconsc:mk(binary(), #{
+                in => query,
+                required => false,
+                desc => <<"Node name">>,
+                example => atom_to_list(node())
+            })
+        },
+        {
+            clientid,
+            hoconsc:mk(binary(), #{
+                in => query,
+                required => false,
+                desc => <<"Client ID">>
+            })
+        },
+        {
+            qos,
+            hoconsc:mk(emqx_schema:qos(), #{
+                in => query,
+                required => false,
+                desc => <<"QoS">>
+            })
+        },
+        {
+            topic,
+            hoconsc:mk(binary(), #{
+                in => query,
+                required => false,
+                desc => <<"Topic, url encoding">>
+            })
+        },
+        {
+            match_topic,
+            hoconsc:mk(binary(), #{
+                in => query,
+                required => false,
+                desc => <<"Match topic string, url encoding">>
+            })
+        },
+        {
+            share_group,
+            hoconsc:mk(binary(), #{
+                in => query,
+                required => false,
+                desc => <<"Shared subscription group name">>
+            })
+        }
+    ].
+
+subscriptions(get, #{query_string := QString}) ->
+    Response =
+        case maps:get(<<"node">>, QString, undefined) of
+            undefined ->
+                emqx_mgmt_api:cluster_query(
+                    QString,
+                    ?SUBS_QTABLE,
+                    ?SUBS_QSCHEMA,
+                    ?QUERY_FUN
+                );
+            Node0 ->
+                emqx_mgmt_api:node_query(
+                    binary_to_atom(Node0, utf8),
+                    QString,
+                    ?SUBS_QTABLE,
+                    ?SUBS_QSCHEMA,
+                    ?QUERY_FUN
+                )
+        end,
+    case Response of
+        {error, page_limit_invalid} ->
+            {400, #{code => <<"INVALID_PARAMETER">>, message => <<"page_limit_invalid">>}};
+        {error, Node, {badrpc, R}} ->
+            Message = list_to_binary(io_lib:format("bad rpc call ~p, Reason ~p", [Node, R])),
+            {500, #{code => <<"NODE_DOWN">>, message => Message}};
+        Result ->
+            {200, Result}
     end.
-
-lookup(#{node := Node, clientid := ClientId}, _Params) ->
-    minirest:return({ok, format(emqx_mgmt:lookup_subscriptions(Node, emqx_mgmt_util:urldecode(ClientId)))});
-
-lookup(#{clientid := ClientId}, _Params) ->
-    minirest:return({ok, format(emqx_mgmt:lookup_subscriptions(emqx_mgmt_util:urldecode(ClientId)))}).
 
 format(Items) when is_list(Items) ->
     [format(Item) || Item <- Items];
-
 format({{Subscriber, Topic}, Options}) ->
     format({Subscriber, Topic, Options});
-
-format({_Subscriber, Topic, Options = #{share := Group}}) ->
-    QoS = maps:get(qos, Options),
-    #{node => node(), topic => filename:join([<<"$share">>, Group, Topic]), clientid => maps:get(subid, Options), qos => QoS};
 format({_Subscriber, Topic, Options}) ->
-    QoS = maps:get(qos, Options),
-    #{node => node(), topic => Topic, clientid => maps:get(subid, Options), qos => QoS}.
+    maps:merge(
+        #{
+            topic => get_topic(Topic, Options),
+            clientid => maps:get(subid, Options),
+            node => node()
+        },
+        maps:with([qos, nl, rap, rh], Options)
+    ).
+
+get_topic(Topic, #{share := Group}) ->
+    filename:join([<<"$share">>, Group, Topic]);
+get_topic(Topic, _) ->
+    Topic.
 
 %%--------------------------------------------------------------------
 %% Query Function
 %%--------------------------------------------------------------------
 
-query({Qs, []}, Start, Limit) ->
+query(Tab, {Qs, []}, Continuation, Limit) ->
     Ms = qs2ms(Qs),
-    emqx_mgmt_api:select_table(emqx_suboption, Ms, Start, Limit, fun format/1);
-
-query({Qs, Fuzzy}, Start, Limit) ->
+    emqx_mgmt_api:select_table_with_count(
+        Tab,
+        Ms,
+        Continuation,
+        Limit,
+        fun format/1
+    );
+query(Tab, {Qs, Fuzzy}, Continuation, Limit) ->
     Ms = qs2ms(Qs),
-    MatchFun = match_fun(Ms, Fuzzy),
-    emqx_mgmt_api:traverse_table(emqx_suboption, MatchFun, Start, Limit, fun format/1).
+    FuzzyFilterFun = fuzzy_filter_fun(Fuzzy),
+    emqx_mgmt_api:select_table_with_count(
+        Tab,
+        {Ms, FuzzyFilterFun},
+        Continuation,
+        Limit,
+        fun format/1
+    ).
 
-match_fun(Ms, Fuzzy) ->
-    MsC = ets:match_spec_compile(Ms),
-    fun(Rows) ->
-         case ets:match_spec_run(Rows, MsC) of
-             [] -> [];
-             Ls -> lists:filter(fun(E) -> run_fuzzy_match(E, Fuzzy) end, Ls)
-         end
+fuzzy_filter_fun(Fuzzy) ->
+    fun(MsRaws) when is_list(MsRaws) ->
+        lists:filter(
+            fun(E) -> run_fuzzy_filter(E, Fuzzy) end,
+            MsRaws
+        )
     end.
 
-run_fuzzy_match(_, []) ->
+run_fuzzy_filter(_, []) ->
     true;
-run_fuzzy_match(E = {{_, Topic}, _}, [{topic, match, TopicFilter}|Fuzzy]) ->
-    emqx_topic:match(Topic, TopicFilter) andalso run_fuzzy_match(E, Fuzzy).
+run_fuzzy_filter(E = {{_, Topic}, _}, [{topic, match, TopicFilter} | Fuzzy]) ->
+    emqx_topic:match(Topic, TopicFilter) andalso run_fuzzy_filter(E, Fuzzy).
 
 %%--------------------------------------------------------------------
 %% Query String to Match Spec
@@ -146,7 +234,7 @@ update_ms(clientid, X, {{Pid, Topic}, Opts}) ->
     {{Pid, Topic}, Opts#{subid => X}};
 update_ms(topic, X, {{Pid, _Topic}, Opts}) ->
     {{Pid, X}, Opts};
-update_ms(share, X, {{Pid, Topic}, Opts}) ->
+update_ms(share_group, X, {{Pid, Topic}, Opts}) ->
     {{Pid, Topic}, Opts#{share => X}};
 update_ms(qos, X, {{Pid, Topic}, Opts}) ->
     {{Pid, Topic}, Opts#{qos => X}}.

@@ -1,5 +1,5 @@
 
-EMQ X Retainer
+EMQX Retainer
 ==============
 
 The retainer plugin is responsible for storing retained MQTT messages.
@@ -13,10 +13,9 @@ etc/emqx_retainer.conf:
 ## Where to store the retained messages.
 ## Notice that all nodes in a cluster are to have the same storage_type.
 ##
-## Value: ram | disc | disc_only
+## Value: ram | disc
 ##  - ram: memory only
 ##  - disc: both memory and disc
-##  - disc_only: disc only
 ##
 ## Default: ram
 retainer.storage_type = ram
@@ -43,7 +42,7 @@ retainer.max_payload_size = 64KB
 ##  - 30m: 30 minutes
 ##  - 20s: 20 seconds
 ##
-## Defaut: 0
+## Default: 0
 retainer.expiry_interval = 0
 ```
 
@@ -55,5 +54,4 @@ Apache License Version 2.0
 Author
 ------
 
-EMQ X Team
-
+EMQX Team

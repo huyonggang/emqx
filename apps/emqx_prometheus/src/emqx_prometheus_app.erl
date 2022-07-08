@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,20 +18,26 @@
 
 -behaviour(application).
 
--emqx_plugin(?MODULE).
+-include("emqx_prometheus.hrl").
 
 %% Application callbacks
--export([ start/2
-        , stop/1
-        ]).
-
--define(APP, emqx_prometheus).
+-export([
+    start/2,
+    stop/1
+]).
 
 start(_StartType, _StartArgs) ->
-    PushGateway = application:get_env(?APP, push_gateway, undefined),
-    Interval = application:get_env(?APP, interval, 5000),
-    emqx_prometheus_sup:start_link(PushGateway, Interval).
+    {ok, Sup} = emqx_prometheus_sup:start_link(),
+    maybe_enable_prometheus(),
+    {ok, Sup}.
 
 stop(_State) ->
     ok.
 
+maybe_enable_prometheus() ->
+    case emqx_conf:get([prometheus, enable], false) of
+        true ->
+            emqx_prometheus_sup:start_child(?APP, emqx_conf:get([prometheus], #{}));
+        false ->
+            ok
+    end.

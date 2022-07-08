@@ -1,105 +1,185 @@
 name: Build slim packages
 
+concurrency:
+  group: slim-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
-    tags:
-      - v*
-      - e*
+    branches:
+      - master
   pull_request:
+    # GitHub pull_request action is by default triggered when
+    # opened reopened or synchronize,
+    # we add labeled and unlabeled to the list because
+    # the mac job dpends on the PR having a 'Mac' label
+    types:
+      - labeled
+      - unlabeled
+      - opened
+      - reopened
+      - synchronize
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ubuntu-20.04
+  linux:
+    runs-on: aws-amd64
 
     strategy:
+      fail-fast: false
       matrix:
-        erl_otp:
-        - erl23.2.7.2-emqx-2
+        profile:
+        - emqx
+        - emqx-enterprise
+        otp:
+        - 24.2.1-1
+        elixir:
+        - 1.13.4
         os:
         - ubuntu20.04
-        - centos7
+        - el8
 
-    container: emqx/build-env:${{ matrix.erl_otp }}-${{ matrix.os }}
+    container: "ghcr.io/emqx/emqx-builder/5.0-17:${{ matrix.elixir }}-${{ matrix.otp }}-${{ matrix.os }}"
 
     steps:
-    - uses: actions/checkout@v1
+    - uses: AutoModality/action-clean@v1
+    - uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
     - name: prepare
       run: |
-        if make emqx-ee --dry-run > /dev/null 2>&1; then
-          echo "https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com" > $HOME/.git-credentials
-          git config --global credential.helper store
-          echo "${{ secrets.CI_GIT_TOKEN }}" >> ./scripts/git-token
-          echo "EMQX_NAME=emqx-ee" >> $GITHUB_ENV
-        else
-          echo "EMQX_NAME=emqx" >> $GITHUB_ENV
-        fi
-    - name: build zip packages
-      run: make ${EMQX_NAME}-zip
-    - name: build deb/rpm packages
-      run: make ${EMQX_NAME}-pkg
-    - name: pakcages test
+        echo "EMQX_NAME=${{ matrix.profile }}" >> $GITHUB_ENV
+        echo "CODE_PATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+    - name: Work around https://github.com/actions/checkout/issues/766
       run: |
-        export CODE_PATH=$GITHUB_WORKSPACE
-        .ci/build_packages/tests.sh
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+    - name: build and test tgz package
+      run: |
+        make ${EMQX_NAME}-tgz
+        ./scripts/pkg-tests.sh ${EMQX_NAME}-tgz
+    - name: run static checks
+      if: contains(matrix.os, 'ubuntu')
+      run: |
+        make static_checks
+    - name: build and test deb/rpm packages
+      run: |
+        make ${EMQX_NAME}-pkg
+        ./scripts/pkg-tests.sh ${EMQX_NAME}-pkg
+    - name: build and test tgz package (Elixir)
+      run: |
+        make ${EMQX_NAME}-elixir-tgz
+        ./scripts/pkg-tests.sh ${EMQX_NAME}-elixir-tgz
+    - name: build and test deb/rpm packages (Elixir)
+      run: |
+        make ${EMQX_NAME}-elixir-pkg
+        ./scripts/pkg-tests.sh ${EMQX_NAME}-elixir-pkg
     - uses: actions/upload-artifact@v2
       with:
-        name: ${{ matrix.os }}
-        path: _packages/**/*.zip
+        name: ${{ matrix.profile}}-${{ matrix.otp }}-${{ matrix.os }}
+        path: _packages/${{ matrix.profile}}/*.tar.gz
+    - uses: actions/upload-artifact@v2
+      with:
+        name: "${{ matrix.profile }}_schema_dump"
+        path: _build/*/lib/emqx_dashboard/priv/www/static/schema.json
+
+  windows:
+    runs-on: windows-2019
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - emqx
+        otp:
+          - 24.2.1
+    steps:
+    - uses: actions/checkout@v2
+    - uses: ilammy/msvc-dev-cmd@v1
+    - uses: erlef/setup-beam@v1
+      with:
+        otp-version: ${{ matrix.otp }}
+    - name: build
+      env:
+        PYTHON: python
+        DIAGNOSTIC: 1
+      run: |
+        # ensure crypto app (openssl)
+        erl -eval "erlang:display(crypto:info_lib())" -s init stop
+        make ${{ matrix.profile }}-tgz
+    - name: run emqx
+      timeout-minutes: 5
+      run: |
+        ./_build/${{ matrix.profile }}/rel/emqx/bin/emqx start
+        Start-Sleep -s 5
+        echo "EMQX started"
+        ./_build/${{ matrix.profile }}/rel/emqx/bin/emqx stop
+        echo "EMQX stopped"
+        ./_build/${{ matrix.profile }}/rel/emqx/bin/emqx install
+        echo "EMQX installed"
+        ./_build/${{ matrix.profile }}/rel/emqx/bin/emqx uninstall
+        echo "EMQX uninstalled"
+    - uses: actions/upload-artifact@v2
+      with:
+        name: windows
+        path: _packages/${{ matrix.profile}}/*.tar.gz
 
   mac:
-    runs-on: macos-10.15
-
     strategy:
+      fail-fast: false
       matrix:
-        erl_otp:
-        - 23.2.7.2-emqx-2
+        profile:
+        - emqx
+        - emqx-enterprise
+        otp:
+        - 24.2.1-1
+        macos:
+        - macos-11
+        - macos-10.15
+
+    runs-on: ${{ matrix.macos }}
 
     steps:
-    - uses: actions/checkout@v1
-    - name: prepare
-      run: |
-        if make emqx-ee --dry-run > /dev/null 2>&1; then
-          echo "https://ci%40emqx.io:${{ secrets.CI_GIT_TOKEN }}@github.com" > $HOME/.git-credentials
-          git config --global credential.helper store
-          echo "${{ secrets.CI_GIT_TOKEN }}" >> ./scripts/git-token
-          echo "EMQX_NAME=emqx-ee" >> $GITHUB_ENV
-        else
-          echo "EMQX_NAME=emqx" >> $GITHUB_ENV
-        fi
+    - uses: actions/checkout@v2
     - name: prepare
       run: |
         brew update
-        brew install curl zip unzip gnu-sed kerl unixodbc freetds
+        brew install curl zip unzip kerl coreutils
+        echo "/usr/local/opt/bison/bin" >> $GITHUB_PATH
         echo "/usr/local/bin" >> $GITHUB_PATH
-        git config --global credential.helper store
+        echo "EMQX_NAME=${{ matrix.profile }}" >> $GITHUB_ENV
+        echo "BUILD_WITH_QUIC=1" >> $GITHUB_ENV
     - uses: actions/cache@v2
       id: cache
       with:
-        path: ~/.kerl
-        key: erl${{ matrix.erl_otp }}-macos10.15
+        path: ~/.kerl/${{ matrix.otp }}
+        key: otp-install-${{ matrix.otp }}-${{ matrix.macos }}
     - name: build erlang
       if: steps.cache.outputs.cache-hit != 'true'
       timeout-minutes: 60
+      env:
+        KERL_BUILD_BACKEND: git
+        OTP_GITHUB_URL: https://github.com/emqx/otp
       run: |
-        export OTP_GITHUB_URL="https://github.com/emqx/otp"
-        kerl build ${{ matrix.erl_otp }}
-        kerl install ${{ matrix.erl_otp }} $HOME/.kerl/${{ matrix.erl_otp }}
-    - name: build
+        kerl update releases
+        kerl build ${{ matrix.otp }}
+        kerl install ${{ matrix.otp }} $HOME/.kerl/${{ matrix.otp }}
+    - name: build ${{ matrix.profile }}
+      env:
+        AUTO_INSTALL_BUILD_DEPS: 1
       run: |
-        . $HOME/.kerl/${{ matrix.erl_otp }}/activate
+        . $HOME/.kerl/${{ matrix.otp }}/activate
         make ensure-rebar3
         sudo cp rebar3 /usr/local/bin/rebar3
-        make ${EMQX_NAME}-zip
+        make ${{ matrix.profile }}-tgz
     - name: test
       run: |
-        pkg_name=$(basename _packages/${EMQX_NAME}/emqx-*.zip)
-        unzip -q _packages/${EMQX_NAME}/$pkg_name
-        gsed -i '/emqx_telemetry/d' ./emqx/data/loaded_plugins
+        pkg_name=$(find _packages/${{ matrix.profile }} -mindepth 1 -maxdepth 1 -iname \*.tar.gz)
+        mkdir -p emqx
+        tar -C emqx -zxf $pkg_name
+        # gsed -i '/emqx_telemetry/d' ./emqx/data/loaded_plugins
         ./emqx/bin/emqx start || cat emqx/log/erlang.log.1
         ready='no'
-        for i in {1..10}; do
-          if curl -fs 127.0.0.1:18083 > /dev/null; then
+        for i in {1..30}; do
+          if curl -fs 127.0.0.1:18083/api/v5/status > /dev/null; then
             ready='yes'
             break
           fi
@@ -116,4 +196,39 @@ jobs:
     - uses: actions/upload-artifact@v2
       with:
         name: macos
-        path: _packages/**/*.zip
+        path: _packages/**/*.tar.gz
+
+  spellcheck:
+    needs: linux
+    strategy:
+      matrix:
+        profile:
+        - emqx
+        - emqx-enterprise
+    runs-on: aws-amd64
+    container: "ghcr.io/emqx/emqx-schema-validate:0.3.3"
+    steps:
+    - uses: actions/download-artifact@v2
+      name: Download schema dump
+      with:
+        name: "${{ matrix.profile }}_schema_dump"
+        path: /tmp/
+    - name: Run spellcheck
+      run: |
+        cd /LanguageTool
+        bash start.sh > /dev/null &
+        ./emqx_schema_validate /tmp/${{ matrix.profile }}/lib/emqx_dashboard/priv/www/static/schema.json
+
+  allgood_packaging:
+    runs-on: ubuntu-latest
+    needs:
+      - linux
+      - windows
+      - mac
+    steps:
+    - name: Check if all packging builds succeeded
+      uses: re-actors/alls-green@release/v1
+      with:
+        #allowed-failures:
+        #allowed-skips:
+        jobs: ${{ toJSON(needs) }}

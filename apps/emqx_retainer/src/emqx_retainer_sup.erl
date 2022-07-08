@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,19 +18,29 @@
 
 -behaviour(supervisor).
 
--export([start_link/1]).
+-export([start_link/0]).
 
 -export([init/1]).
 
-start_link(Env) ->
-	supervisor:start_link({local, ?MODULE}, ?MODULE, [Env]).
+start_link() ->
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-init([Env]) ->
-	{ok, {{one_for_one, 10, 3600},
-          [#{id       => retainer,
-             start    => {emqx_retainer, start_link, [Env]},
-             restart  => permanent,
-             shutdown => 5000,
-             type     => worker,
-             modules  => [emqx_retainer]}]}}.
-
+init([]) ->
+    PoolSpec = emqx_pool_sup:spec([
+        emqx_retainer_dispatcher,
+        hash,
+        emqx_vm:schedulers(),
+        {emqx_retainer_dispatcher, start_link, []}
+    ]),
+    {ok,
+        {{one_for_one, 10, 3600}, [
+            #{
+                id => retainer,
+                start => {emqx_retainer, start_link, []},
+                restart => permanent,
+                shutdown => 5000,
+                type => worker,
+                modules => [emqx_retainer]
+            },
+            PoolSpec
+        ]}}.

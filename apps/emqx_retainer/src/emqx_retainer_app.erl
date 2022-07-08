@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,20 +18,15 @@
 
 -behaviour(application).
 
--emqx_plugin(?MODULE).
-
--export([ start/2
-        , stop/1
-        ]).
+-export([
+    start/2,
+    stop/1
+]).
 
 start(_Type, _Args) ->
-    Env = application:get_all_env(emqx_retainer),
-    {ok, Sup} = emqx_retainer_sup:start_link(Env),
-    emqx_retainer:load(Env),
-    emqx_retainer_cli:load(),
-    {ok, Sup}.
+    ok = emqx_retainer_mnesia_cli:load(),
+    emqx_retainer_sup:start_link().
 
 stop(_State) ->
-    emqx_retainer_cli:unload(),
-    emqx_retainer:unload().
-
+    ok = emqx_retainer_mnesia_cli:unload(),
+    ok.
